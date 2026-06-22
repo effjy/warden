@@ -19,8 +19,8 @@ CONFDIR  = /etc/warden
 
 all: $(GUI) $(DAEMON)
 
-$(GUI): src/gui.cpp src/warden_proto.h
-	$(CXX) $(CXXFLAGS) $(GTK_CF) -o $@ src/gui.cpp $(GTK_LIB)
+$(GUI): src/gui.cpp src/tray.cpp src/tray.h src/warden_proto.h
+	$(CXX) $(CXXFLAGS) $(GTK_CF) -o $@ src/gui.cpp src/tray.cpp $(GTK_LIB)
 
 $(DAEMON): src/daemon.cpp src/warden_proto.h src/sha256.h
 	$(CXX) $(CXXFLAGS) $(NFQ_CF) -o $@ src/daemon.cpp $(NFQ_LIB)

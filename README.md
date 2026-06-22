@@ -154,6 +154,20 @@ keeps applying even if the program is updated.
 The rule store is a plain-text file at `/etc/warden/rules.conf`
 (one rule per line: `verdict  sha256  /path/to/exe`) — safe to read or edit by hand.
 
+### Minimize to the system tray
+
+Warden installs a **tray icon** so it can keep running quietly in the
+background. Closing the window then **minimizes it to the tray** instead of
+quitting; left-click the icon (or its **Show Warden** menu entry) to bring the
+window back, and **Quit Warden** to exit for good.
+
+This uses the freedesktop/KDE **StatusNotifierItem** protocol over D-Bus
+directly — no `libappindicator` dependency. It works on any desktop with an
+SNI-capable tray (KDE, and GNOME/MATE/XFCE with the usual tray applet or
+extension). On a panel that only supports the older XEmbed tray, run a bridge
+such as [`snixembed`](https://git.sr.ht/~steef/snixembed). If no tray is
+present at all, Warden detects that and the window simply closes normally.
+
 **Stop enforcing:**
 
 ```sh

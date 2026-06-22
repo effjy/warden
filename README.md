@@ -2,7 +2,7 @@
 
 <img src="icons/warden.svg" width="120" alt="Warden">
 
-# Warden
+<a href="https://github.com/effjy/warden/"><img src="titles/warden-title.svg" height="52" alt="Warden"></a>
 
 **Per-process outbound firewall for Linux — decide, connection by connection, which programs are allowed to reach the network.**
 

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="35%" cy="25%" r="90%">
+      <stop offset="0%" stop-color="#2a2f45"/>
+      <stop offset="55%" stop-color="#1a1b26"/>
+      <stop offset="100%" stop-color="#16161e"/>
+    </radialGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7aa2f7"/>
+      <stop offset="100%" stop-color="#3b4a82"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)" stroke="#7aa2f7" stroke-opacity="0.25" stroke-width="2"/>
+
+  <!-- shield body -->
+  <path d="M128 40 L196 64 V128 C196 172 166 200 128 216 C90 200 60 172 60 128 V64 Z"
+        fill="url(#shield)" stroke="#9ab4ff" stroke-opacity="0.6" stroke-width="2"/>
+
+  <!-- darker inner gatehouse panel for portcullis contrast -->
+  <path d="M128 58 L178 76 V126 C178 160 156 182 128 196 C100 182 78 160 78 126 V76 Z"
+        fill="#161a2e" fill-opacity="0.78"/>
+
+  <!-- portcullis: vertical bars -->
+  <g stroke="#d6e0ff" stroke-width="7" stroke-linecap="round">
+    <line x1="98"  y1="78" x2="98"  y2="186"/>
+    <line x1="128" y1="78" x2="128" y2="196"/>
+    <line x1="158" y1="78" x2="158" y2="186"/>
+  </g>
+  <!-- portcullis: horizontal bars -->
+  <g stroke="#aebfff" stroke-width="6" stroke-linecap="round" stroke-opacity="0.95">
+    <line x1="86" y1="96"  x2="170" y2="96"/>
+    <line x1="84" y1="126" x2="172" y2="126"/>
+    <line x1="88" y1="156" x2="168" y2="156"/>
+  </g>
+  <!-- spikes at the gate's foot -->
+  <g fill="#c0caf5">
+    <path d="M98 186 l-7 12 14 0 Z"/>
+    <path d="M158 186 l-7 12 14 0 Z"/>
+  </g>
+
+  <!-- deny accent: a severed connection node -->
+  <circle cx="190" cy="74" r="20" fill="#1a1b26" stroke="#f7768e" stroke-width="6"/>
+  <line x1="178" y1="62" x2="202" y2="86" stroke="#f7768e" stroke-width="6" stroke-linecap="round"/>
+</svg>

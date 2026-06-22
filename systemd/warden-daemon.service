@@ -1,0 +1,19 @@
+[Unit]
+Description=Warden outbound-connection firewall daemon
+Documentation=https://github.com/effjy/warden
+After=network-pre.target nftables.service
+Wants=network-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/warden-daemon
+# The daemon removes its own nftables table on exit; restart keeps egress
+# control in place if it ever crashes. The nft rule is installed with `bypass`,
+# so while the daemon is down new connections are accepted (fail-open).
+Restart=on-failure
+RestartSec=2
+# Needs CAP_NET_ADMIN for NFQUEUE + nftables; runs as root for /proc attribution.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

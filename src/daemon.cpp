@@ -16,6 +16,9 @@
 // Author: Jean-Francois Lachance-Caumartin
 // Repository: https://github.com/effjy/warden/
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE            // struct ucred / SO_PEERCRED
+#endif
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
@@ -66,6 +69,19 @@ struct Conn {                                 // a resolved outbound attempt
     std::string dst_ip;
     uint16_t    dst_port = 0;
 };
+
+static struct nfq_q_handle *g_qh = nullptr;   // for deferred (async) verdicts
+static uid_t g_owner_uid = (uid_t)-1;         // UID allowed on the control socket
+static std::string g_rx;                      // accumulated bytes from the GUI
+
+// A connection held in NFQUEUE while we wait for the user to decide.
+struct Pending { uint32_t pkt_id; Conn conn; long deadline_ms; };
+static std::unordered_map<uint32_t, Pending> g_pending;   // ask id -> held packet
+
+// Cache of exe-path -> SHA-256, keyed on size+mtime so we hash a binary once
+// rather than on every connection it makes.
+struct HashEntry { time_t mtime; off_t size; std::string sha; };
+static std::unordered_map<std::string, HashEntry> g_hash_cache;
 
 // ---------------------------------------------------------------------------
 // nftables plumbing
@@ -126,6 +142,20 @@ static void save_rules() {
         fprintf(f, "%s %s %s\n", kv.second.allow ? "allow" : "deny",
                 kv.second.sha.empty() ? "-" : kv.second.sha.c_str(), kv.first.c_str());
     fclose(f);
+}
+
+// SHA-256 of an executable, memoised by (size, mtime) so a busy allowed program
+// isn't re-hashed on every new connection. Returns "" if the file is unreadable.
+static std::string cached_hex(const std::string &path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return "";
+    auto it = g_hash_cache.find(path);
+    if (it != g_hash_cache.end() &&
+        it->second.mtime == st.st_mtime && it->second.size == st.st_size)
+        return it->second.sha;
+    std::string h = sha256::file_hex(path);
+    g_hash_cache[path] = { st.st_mtime, st.st_size, h };
+    return h;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,70 +255,92 @@ static void emit_event(bool allow, const Conn &c, const char *reason) {
     send_line(g_client_fd, buf);
 }
 
-// Handle one inbound line from the GUI. Returns false if the peer hung up.
-static bool handle_gui_line(char *line, bool *got_verdict, uint32_t want_id,
-                            bool *verdict_allow, bool *verdict_forever) {
-    if (strncmp(line, "VERDICT\t", 8) == 0) {
-        uint32_t id; char act[16], scope[16];
-        if (sscanf(line + 8, "%u\t%15[^\t]\t%15s", &id, act, scope) == 3 && id == want_id) {
-            *verdict_allow   = (strcmp(act, "allow") == 0);
-            *verdict_forever = (strcmp(scope, "forever") == 0);
-            *got_verdict = true;
-        }
-    } else if (strncmp(line, "RULE\t", 5) == 0) {
-        char act[16]; char *exe = strchr(line + 5, '\t');
-        if (exe) { *exe++ = 0; Rule r; r.allow = (strcmp(line + 5, "allow") == 0);
-                   // Pin allow rules to the binary's hash (tamper-evident); leave
-                   // deny rules path-only so a block always applies.
-                   r.sha = r.allow ? sha256::file_hex(exe) : ""; g_rules[exe] = r; save_rules(); }
-        (void)act;
-    } else if (strncmp(line, "DELRULE\t", 8) == 0) {
-        g_rules.erase(line + 8); save_rules();
-    }
-    return true;
-}
-
 static long now_ms() {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
-// Block until the GUI answers prompt `id`, the timeout elapses, or it hangs up.
-static bool ask_gui(uint32_t id, bool *allow, bool *forever) {
-    if (g_client_fd < 0) return false;
-    bool got = false;
-    const long deadline = now_ms() + WARDEN_PROMPT_TIMEOUT_MS;
-    std::string acc;
-    while (!got) {
-        long remaining = deadline - now_ms();
-        if (remaining <= 0) break;
-        struct pollfd pfd = { g_client_fd, POLLIN, 0 };
-        int r = poll(&pfd, 1, (int)remaining);
-        if (r <= 0) break;              // timeout or error
-        char buf[1024];
-        ssize_t n = read(g_client_fd, buf, sizeof(buf) - 1);
-        if (n <= 0) { close(g_client_fd); g_client_fd = -1; return false; }
-        acc.append(buf, n);
-        size_t nl;
-        while ((nl = acc.find('\n')) != std::string::npos) {
-            std::string line = acc.substr(0, nl);
-            acc.erase(0, nl + 1);
-            handle_gui_line(&line[0], &got, id, allow, forever);
-            if (got) break;
-        }
+// Resolve a held connection: optionally persist a "forever" rule, log it, and
+// release the packet with the chosen verdict. Removes it from g_pending.
+static void finish(uint32_t ask_id, bool allow, bool forever, const char *reason) {
+    auto it = g_pending.find(ask_id);
+    if (it == g_pending.end()) return;
+    Pending p = it->second;          // copy out before erasing
+    g_pending.erase(it);
+
+    if (forever && p.conn.exe != "?") {
+        Rule r; r.allow = allow;
+        r.sha = allow ? cached_hex(p.conn.exe) : "";   // pin allows only
+        g_rules[p.conn.exe] = r; save_rules();
     }
-    return got;
+    emit_event(allow, p.conn, reason);
+    nfq_set_verdict(g_qh, p.pkt_id, allow ? NF_ACCEPT : NF_DROP, 0, nullptr);
+}
+
+// Default-resolve any prompts that have waited past the timeout.
+static void check_timeouts() {
+    if (g_pending.empty()) return;
+    long t = now_ms();
+    std::vector<uint32_t> expired;
+    for (auto &kv : g_pending)
+        if (kv.second.deadline_ms <= t) expired.push_back(kv.first);
+    for (uint32_t id : expired)
+        finish(id, WARDEN_DEFAULT_NO_UI_ACCEPT, false, "timeout-default");
+}
+
+// Default-resolve everything (e.g. when the GUI disconnects with prompts open).
+static void resolve_all_pending(const char *reason) {
+    std::vector<uint32_t> ids;
+    for (auto &kv : g_pending) ids.push_back(kv.first);
+    for (uint32_t id : ids) finish(id, WARDEN_DEFAULT_NO_UI_ACCEPT, false, reason);
+}
+
+// Handle one line from the GUI (verdicts and rule edits).
+static void process_client_line(char *line) {
+    if (strncmp(line, "VERDICT\t", 8) == 0) {
+        uint32_t id; char act[16], scope[16];
+        if (sscanf(line + 8, "%u\t%15[^\t]\t%15s", &id, act, scope) == 3)
+            finish(id, strcmp(act, "allow") == 0, strcmp(scope, "forever") == 0, "prompt");
+    } else if (strncmp(line, "RULE\t", 5) == 0) {
+        char *exe = strchr(line + 5, '\t');
+        if (exe) { *exe++ = 0; Rule r; r.allow = (strcmp(line + 5, "allow") == 0);
+                   // Pin allow rules to the binary's hash (tamper-evident); leave
+                   // deny rules path-only so a block always applies.
+                   r.sha = r.allow ? cached_hex(exe) : ""; g_rules[exe] = r; save_rules(); }
+    } else if (strncmp(line, "DELRULE\t", 8) == 0) {
+        g_rules.erase(line + 8); save_rules();
+    }
+}
+
+// Drain newline-delimited messages from the GUI, keeping any partial tail in the
+// shared g_rx buffer so nothing is ever lost between reads.
+static void drain_client(void) {
+    char buf[2048];
+    ssize_t n = read(g_client_fd, buf, sizeof(buf));
+    if (n <= 0) {                              // GUI hung up
+        close(g_client_fd); g_client_fd = -1; g_rx.clear();
+        resolve_all_pending("gui-gone-default");
+        return;
+    }
+    g_rx.append(buf, n);
+    size_t nl;
+    while ((nl = g_rx.find('\n')) != std::string::npos) {
+        std::string line = g_rx.substr(0, nl);
+        g_rx.erase(0, nl + 1);
+        if (!line.empty()) process_client_line(&line[0]);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// NFQUEUE callback
+// NFQUEUE callback — never blocks; unknown connections are held in g_pending
+// and resolved later from the main loop when the user answers.
 // ---------------------------------------------------------------------------
-static int verdict_for(struct nfq_q_handle *qh, uint32_t pkt_id, const Conn &c) {
+static int decide(struct nfq_q_handle *qh, uint32_t pkt_id, const Conn &c) {
     // 1. Stored rule?
     auto it = g_rules.find(c.exe);
     if (it != g_rules.end()) {
         bool tampered = !it->second.sha.empty() && c.exe != "?" &&
-                        it->second.sha != sha256::file_hex(c.exe);
+                        it->second.sha != cached_hex(c.exe);
         if (!tampered) {
             emit_event(it->second.allow, c, "rule");
             return nfq_set_verdict(qh, pkt_id, it->second.allow ? NF_ACCEPT : NF_DROP, 0, nullptr);
@@ -296,24 +348,22 @@ static int verdict_for(struct nfq_q_handle *qh, uint32_t pkt_id, const Conn &c) 
         emit_event(false, c, "binary-changed");   // fall through to a fresh prompt
     }
 
-    // 2. Ask the GUI.
+    // 2. No GUI to ask? Apply the fail-open default immediately.
+    if (g_client_fd < 0) {
+        bool allow = WARDEN_DEFAULT_NO_UI_ACCEPT;
+        emit_event(allow, c, "no-ui-default");
+        return nfq_set_verdict(qh, pkt_id, allow ? NF_ACCEPT : NF_DROP, 0, nullptr);
+    }
+
+    // 3. Hold the packet and ask the GUI; the verdict is set later in finish().
     uint32_t id = g_next_id++;
+    g_pending[id] = { pkt_id, c, now_ms() + WARDEN_PROMPT_TIMEOUT_MS };
     char ask[640];
     snprintf(ask, sizeof(ask), "ASK\t%u\t%s\t%d\t%s\t%s\t%s\t%u",
              id, c.proto.c_str(), c.pid, c.comm.c_str(), c.exe.c_str(),
              c.dst_ip.c_str(), c.dst_port);
     send_line(g_client_fd, ask);
-
-    bool allow = WARDEN_DEFAULT_NO_UI_ACCEPT, forever = false;
-    bool answered = ask_gui(id, &allow, &forever);
-
-    if (answered && forever && c.exe != "?") {
-        Rule r; r.allow = allow;
-        r.sha = allow ? sha256::file_hex(c.exe) : "";  // pin allows only
-        g_rules[c.exe] = r; save_rules();
-    }
-    emit_event(allow, c, answered ? "prompt" : "no-ui-default");
-    return nfq_set_verdict(qh, pkt_id, allow ? NF_ACCEPT : NF_DROP, 0, nullptr);
+    return 0;   // verdict deferred
 }
 
 static int cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *nfa, void *) {
@@ -362,7 +412,7 @@ static int cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *nfa, 
     unsigned long inode = find_inode(src_port, c.dst_ip, c.dst_port, v6);
     inode_to_proc(inode, c);   // best-effort; leaves "?" if the socket vanished
 
-    return verdict_for(qh, pkt_id, c);
+    return decide(qh, pkt_id, c);
 }
 
 // ---------------------------------------------------------------------------
@@ -376,10 +426,37 @@ static int make_listener() {
     a.sun_family = AF_UNIX;
     strncpy(a.sun_path, WARDEN_SOCK, sizeof(a.sun_path) - 1);
     if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { close(fd); return -1; }
-    // The GUI runs as the unprivileged user; let it connect.
+    // The GUI runs as the unprivileged user, so the socket must be connectable;
+    // actual authorization is enforced per-connection with SO_PEERCRED below.
     chmod(WARDEN_SOCK, 0666);
     if (listen(fd, 4) < 0) { close(fd); return -1; }
     return fd;
+}
+
+// Accept a GUI connection, but only from the authorized user. The first
+// non-root UID to connect claims the control channel (overridable with
+// $WARDEN_ALLOW_UID); root is always allowed. This stops another local user
+// from hijacking the firewall by connecting to the world-connectable socket.
+static void accept_client(int lsn) {
+    int c = accept(lsn, nullptr, nullptr);
+    if (c < 0) return;
+
+    struct ucred cred; socklen_t len = sizeof(cred);
+    if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) { close(c); return; }
+
+    if (g_owner_uid == (uid_t)-1 && cred.uid != 0)
+        g_owner_uid = cred.uid;                       // first real user claims it
+    if (cred.uid != 0 && cred.uid != g_owner_uid) {
+        fprintf(stderr, "warden-daemon: rejected control connection from uid %u\n",
+                (unsigned)cred.uid);
+        close(c);
+        return;
+    }
+
+    if (g_client_fd >= 0) close(g_client_fd);
+    g_client_fd = c;
+    g_rx.clear();
+    send_line(g_client_fd, "HELLO\t" WARDEN_VERSION);
 }
 
 static void on_signal(int) { g_stop = 1; }
@@ -403,6 +480,11 @@ int main() {
     if (!qh) { fprintf(stderr, "nfq_create_queue failed (queue %d busy?)\n", WARDEN_QUEUE_NUM);
                nfq_close(h); remove_nft(); return 1; }
     nfq_set_mode(qh, NFQNL_COPY_PACKET, 0xffff);
+    g_qh = qh;   // finish() releases held packets through this
+
+    // Optional explicit owner for multi-user boxes; otherwise the first GUI wins.
+    if (const char *env = getenv("WARDEN_ALLOW_UID"))
+        g_owner_uid = (uid_t)strtoul(env, nullptr, 10);
 
     int qfd = nfq_fd(h);
     int lsn = make_listener();
@@ -421,34 +503,24 @@ int main() {
 
         if (poll(fds, n, 1000) < 0) { if (errno == EINTR) continue; break; }
 
+        int client_fd_snapshot = g_client_fd;   // may change under us in this loop
         for (int i = 0; i < n; ++i) {
             if (!(fds[i].revents & POLLIN)) continue;
             if (fds[i].fd == qfd) {
                 int r = recv(qfd, pktbuf, sizeof(pktbuf), 0);
                 if (r >= 0) nfq_handle_packet(h, pktbuf, r);
             } else if (fds[i].fd == lsn) {
-                int c = accept(lsn, nullptr, nullptr);
-                if (c >= 0) {
-                    if (g_client_fd >= 0) close(g_client_fd);
-                    g_client_fd = c;
-                    send_line(g_client_fd, "HELLO\t" WARDEN_VERSION);
-                }
-            } else if (fds[i].fd == g_client_fd) {
-                // Unsolicited rule edits from the GUI (outside a prompt).
-                char buf[1024];
-                ssize_t rn = read(g_client_fd, buf, sizeof(buf) - 1);
-                if (rn <= 0) { close(g_client_fd); g_client_fd = -1; }
-                else {
-                    buf[rn] = 0;
-                    char *save, *line = strtok_r(buf, "\n", &save);
-                    bool d1; bool d2, d3;
-                    while (line) { handle_gui_line(line, &d1, 0, &d2, &d3); line = strtok_r(nullptr, "\n", &save); }
-                }
+                accept_client(lsn);
+            } else if (fds[i].fd == client_fd_snapshot && g_client_fd == client_fd_snapshot) {
+                drain_client();   // verdicts + rule edits, partial-line safe
             }
         }
+
+        check_timeouts();   // release any prompts the user never answered
     }
 
     fprintf(stderr, "\nwarden-daemon shutting down — removing nftables rules.\n");
+    resolve_all_pending("shutdown-default");   // release any held packets
     nfq_destroy_queue(qh);
     nfq_close(h);
     remove_nft();

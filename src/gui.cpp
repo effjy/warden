@@ -222,8 +222,12 @@ static void show_prompt(App *app, guint id, const std::string &proto, const std:
                         const std::string &dst_ip, const std::string &dst_port) {
     GtkWidget *dlg = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(dlg), "Connection request");
-    gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(app->window));
-    gtk_window_set_modal(GTK_WINDOW(dlg), TRUE);
+    // Only parent the prompt to the main window when it's actually on screen;
+    // being transient-for a window that's hidden in the tray can leave the
+    // prompt mis-stacked or unmapped on some window managers.
+    if (gtk_widget_get_visible(app->window))
+        gtk_window_set_transient_for(GTK_WINDOW(dlg), GTK_WINDOW(app->window));
+    gtk_window_set_modal(GTK_WINDOW(dlg), gtk_widget_get_visible(app->window));
     gtk_window_set_default_size(GTK_WINDOW(dlg), 460, -1);
     gtk_window_set_icon_name(GTK_WINDOW(dlg), "warden");
     g_object_set_data(G_OBJECT(dlg), "ask-id", GUINT_TO_POINTER(id));
@@ -234,7 +238,11 @@ static void show_prompt(App *app, guint id, const std::string &proto, const std:
     gtk_widget_set_margin_start(box, 20); gtk_widget_set_margin_end(box, 20);
     gtk_window_set_child(GTK_WINDOW(dlg), box);
 
-    std::string headline = "<b>" + comm + "</b> wants to open a connection";
+    // comm comes from /proc and is attacker-influenced, so escape it before it
+    // goes into Pango markup (a name like "a<b" or "me&you" would break it).
+    char *comm_esc = g_markup_escape_text(comm.c_str(), -1);
+    std::string headline = std::string("<b>") + comm_esc + "</b> wants to open a connection";
+    g_free(comm_esc);
     GtkWidget *head = gtk_label_new(nullptr);
     gtk_label_set_markup(GTK_LABEL(head), headline.c_str());
     gtk_label_set_xalign(GTK_LABEL(head), 0.0);

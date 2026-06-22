@@ -65,6 +65,13 @@ verdict is invalidated — Warden prompts again.
 daemon defaults to *accept* when no GUI is connected to answer. A crashed daemon
 or a closed window never silently severs your network.
 
+**Trusted control channel.** Decisions are answered over `/run/warden.sock`.
+Although the socket is connectable by any local process, the daemon checks the
+peer's credentials (`SO_PEERCRED`) and only takes commands from the first
+non-root user that connects — so another local user can't hijack the firewall.
+On a multi-user machine you can pin the allowed user explicitly by setting
+`WARDEN_ALLOW_UID=<uid>` in the service environment.
+
 ---
 
 ## 1. Install the prerequisites

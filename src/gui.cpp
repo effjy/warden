@@ -25,6 +25,7 @@
 #include <sstream>
 
 #include "warden_proto.h"
+#include "tray.h"
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -37,6 +38,7 @@ struct App {
     GtkWidget *rules_box   = nullptr;   // GtkListBox of stored rules
     int        sock_fd     = -1;
     guint      io_source   = 0;
+    bool       tray_active = false;     // true if a system tray accepted our icon
     std::string rx;                      // partial-line receive buffer
 };
 
@@ -387,11 +389,53 @@ static void apply_css(void) {
 }
 
 // ---------------------------------------------------------------------------
+// System tray integration
+// ---------------------------------------------------------------------------
+static void tray_show_cb(void *user) {
+    App *app = (App *)user;
+    if (app->window) {
+        gtk_widget_set_visible(app->window, TRUE);
+        gtk_window_unminimize(GTK_WINDOW(app->window));
+        gtk_window_present(GTK_WINDOW(app->window));
+    }
+}
+
+static void tray_quit_cb(void *user) {
+    App *app = (App *)user;
+    g_application_quit(G_APPLICATION(app->app));
+}
+
+// Closing the window hides it to the tray instead of quitting — but only when a
+// tray actually took our icon, so you can never strand the app with no window.
+static gboolean on_window_close(GtkWindow *win, gpointer data) {
+    App *app = (App *)data;
+    if (app->tray_active) { gtk_widget_set_visible(GTK_WIDGET(win), FALSE); return TRUE; }
+    return FALSE;
+}
+
+// Minimizing also sends the window to the tray. GTK4 has no "minimize" signal,
+// so we watch the toplevel surface's state for the MINIMIZED flag and, when it
+// appears, hide the window instead (the tray icon brings it back).
+static void on_surface_state(GdkToplevel *tl, GParamSpec *, gpointer data) {
+    App *app = (App *)data;
+    if (!app->tray_active || !app->window) return;
+    if (gdk_toplevel_get_state(tl) & GDK_TOPLEVEL_STATE_MINIMIZED)
+        gtk_widget_set_visible(app->window, FALSE);
+}
+
+static void on_window_realize(GtkWidget *w, gpointer data) {
+    GdkSurface *s = gtk_native_get_surface(GTK_NATIVE(w));
+    if (s && GDK_IS_TOPLEVEL(s))
+        g_signal_connect(s, "notify::state", G_CALLBACK(on_surface_state), data);
+}
+
+// ---------------------------------------------------------------------------
 // Window construction
 // ---------------------------------------------------------------------------
 static void activate(GtkApplication *gapp, gpointer data) {
     App *app = (App *)data;
-    if (app->window) { gtk_window_present(GTK_WINDOW(app->window)); return; }
+    if (app->window) { gtk_widget_set_visible(app->window, TRUE);
+                       gtk_window_present(GTK_WINDOW(app->window)); return; }
 
     apply_css();
 
@@ -475,6 +519,15 @@ static void activate(GtkApplication *gapp, gpointer data) {
 
     reload_rules(app);
     log_append(app, "Warden started. Waiting for connection attempts…");
+
+    // Offer a tray icon. If a tray is present, closing the window hides it there
+    // instead of quitting; otherwise the window behaves normally.
+    app->tray_active = tray_init(G_APPLICATION(gapp), "warden",
+                                 tray_show_cb, tray_quit_cb, app);
+    g_signal_connect(app->window, "close-request", G_CALLBACK(on_window_close), app);
+    g_signal_connect(app->window, "realize", G_CALLBACK(on_window_realize), app);
+    if (app->tray_active)
+        log_append(app, "Tray icon active — minimizing or closing the window sends it to the tray.");
 
     if (!connect_daemon(app)) {
         set_status(app, "warden-daemon not running — retrying…", "bad");

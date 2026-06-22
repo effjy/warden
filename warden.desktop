@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Warden
+GenericName=Outbound Firewall
+Comment=Approve or deny each program's outgoing network connections
+Exec=warden
+Icon=warden
+Terminal=false
+Type=Application
+Categories=System;Security;Network;GTK;
+StartupNotify=true
+StartupWMClass=warden
+Keywords=firewall;outbound;egress;connection;network;security;block;allow;

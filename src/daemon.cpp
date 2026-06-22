@@ -409,8 +409,14 @@ static int cb(struct nfq_q_handle *qh, struct nfgenmsg *, struct nfq_data *nfa, 
         return nfq_set_verdict(qh, pkt_id, NF_ACCEPT, 0, nullptr);
     }
 
-    unsigned long inode = find_inode(src_port, c.dst_ip, c.dst_port, v6);
-    inode_to_proc(inode, c);   // best-effort; leaves "?" if the socket vanished
+    // Attribute the owning process. Very short-lived sockets (DNS-over-TLS from
+    // systemd-resolved, say) may not be in /proc/net/tcp at the instant we catch
+    // the SYN, so retry a few times with a tiny delay before giving up on "?".
+    for (int attempt = 0; attempt < 4 && c.pid < 0; ++attempt) {
+        if (attempt) usleep(2000);   // 2 ms between tries (~6 ms worst case)
+        unsigned long inode = find_inode(src_port, c.dst_ip, c.dst_port, v6);
+        if (inode) inode_to_proc(inode, c);
+    }
 
     return decide(qh, pkt_id, c);
 }

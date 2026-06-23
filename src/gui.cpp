@@ -13,6 +13,9 @@
 
 #include <gtk/gtk.h>
 #include <glib-unix.h>
+#ifdef GDK_WINDOWING_X11
+#include <gdk/x11/gdkx.h>   // gdk_x11_get_server_time / set_user_time (raise-to-front)
+#endif
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -35,6 +38,7 @@ struct App {
     GtkWidget *window      = nullptr;
     GtkWidget *status_lbl  = nullptr;
     GtkWidget *log_view    = nullptr;   // GtkTextView activity log
+    GtkTextMark *log_end   = nullptr;   // end-anchored mark for auto-scroll
     GtkWidget *rules_box   = nullptr;   // GtkListBox of stored rules
     int        sock_fd     = -1;
     guint      io_source   = 0;
@@ -70,9 +74,22 @@ static void log_append(App *app, const std::string &line) {
       strftime(t, sizeof(t), "%H:%M:%S  ", &tm); ts = t; }
     std::string full = ts + line + "\n";
     gtk_text_buffer_insert(buf, &end, full.c_str(), -1);
-    // Keep the newest line in view.
-    GtkTextMark *mark = gtk_text_buffer_get_insert(buf);
-    gtk_text_view_scroll_mark_onscreen(GTK_TEXT_VIEW(app->log_view), mark);
+    // Keep the newest line in view. log_end has right gravity, so it always
+    // sits at the very end of the buffer; scroll the view down to it. (Scrolling
+    // to the cursor mark would be wrong — the cursor never leaves the top.)
+    if (app->log_end)
+        gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(app->log_view),
+                                     app->log_end, 0.0, TRUE, 0.0, 1.0);
+}
+
+// Pin the activity log to its newest line. Done on an idle so the text view has
+// been laid out (e.g. just after the window is shown) before we try to scroll.
+static gboolean idle_scroll_log(gpointer data) {
+    App *app = (App *)data;
+    if (app->log_view && app->log_end)
+        gtk_text_view_scroll_to_mark(GTK_TEXT_VIEW(app->log_view),
+                                     app->log_end, 0.0, TRUE, 0.0, 1.0);
+    return G_SOURCE_REMOVE;
 }
 
 static void set_status(App *app, const char *text, const char *css_class) {
@@ -399,13 +416,27 @@ static void apply_css(void) {
 // ---------------------------------------------------------------------------
 // System tray integration
 // ---------------------------------------------------------------------------
+// Bring the main window up in front of whatever else is on screen and pin the
+// activity log to its newest line. When we're restored from the tray there's no
+// GTK input event behind the request, so on X11 the window manager treats the
+// raise as "focus stealing" and stacks us behind the active window. Stamping the
+// surface's user-time with a fresh server timestamp tells the WM this is a
+// genuine user action, so gtk_window_present() actually raises and focuses us.
+static void present_front(App *app) {
+    if (!app->window) return;
+    gtk_widget_set_visible(app->window, TRUE);
+    gtk_window_unminimize(GTK_WINDOW(app->window));
+#ifdef GDK_WINDOWING_X11
+    GdkSurface *surf = gtk_native_get_surface(GTK_NATIVE(app->window));
+    if (surf && GDK_IS_X11_SURFACE(surf))
+        gdk_x11_surface_set_user_time(surf, gdk_x11_get_server_time(surf));
+#endif
+    gtk_window_present(GTK_WINDOW(app->window));
+    g_idle_add(idle_scroll_log, app);
+}
+
 static void tray_show_cb(void *user) {
-    App *app = (App *)user;
-    if (app->window) {
-        gtk_widget_set_visible(app->window, TRUE);
-        gtk_window_unminimize(GTK_WINDOW(app->window));
-        gtk_window_present(GTK_WINDOW(app->window));
-    }
+    present_front((App *)user);
 }
 
 static void tray_quit_cb(void *user) {
@@ -442,8 +473,7 @@ static void on_window_realize(GtkWidget *w, gpointer data) {
 // ---------------------------------------------------------------------------
 static void activate(GtkApplication *gapp, gpointer data) {
     App *app = (App *)data;
-    if (app->window) { gtk_widget_set_visible(app->window, TRUE);
-                       gtk_window_present(GTK_WINDOW(app->window)); return; }
+    if (app->window) { present_front(app); return; }
 
     apply_css();
 
@@ -492,6 +522,10 @@ static void activate(GtkApplication *gapp, gpointer data) {
     gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(app->log_view), FALSE);
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(app->log_view), TRUE);
     gtk_text_view_set_left_margin(GTK_TEXT_VIEW(app->log_view), 8);
+    // End-anchored mark (right gravity) used to keep the newest line in view.
+    { GtkTextBuffer *lb = gtk_text_view_get_buffer(GTK_TEXT_VIEW(app->log_view));
+      GtkTextIter e; gtk_text_buffer_get_end_iter(lb, &e);
+      app->log_end = gtk_text_buffer_create_mark(lb, "log-end", &e, FALSE); }
     GtkWidget *log_scroll = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(log_scroll), app->log_view);
     gtk_widget_set_vexpand(log_scroll, TRUE);
@@ -544,7 +578,7 @@ static void activate(GtkApplication *gapp, gpointer data) {
         }, app);
     }
 
-    gtk_window_present(GTK_WINDOW(app->window));
+    present_front(app);
 }
 
 int main(int argc, char **argv) {
